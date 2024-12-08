@@ -20,6 +20,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/tidwall/redcon"
 	"go.etcd.io/bbolt"
 	"golang.org/x/sync/errgroup"
 )
@@ -29,6 +30,12 @@ var pCounter = promauto.NewCounter(prometheus.CounterOpts{
 })
 var pTimer = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "device_inserted_time",
+})
+var histo = promauto.NewSummary(prometheus.SummaryOpts{
+	Name:       "check_latency",
+	Help:       "Latency of check",
+	Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.01, 0.99: 0.001},
+	MaxAge:     time.Second * 30,
 })
 
 type Operation int
@@ -60,7 +67,7 @@ func processTL(campaign int, path string, db *bbolt.DB) error {
 	lines := linesPool.Get().([]string)
 	// Create a new scanner to read the file
 	scanner := bufio.NewScanner(file)
-	ch := make(chan []string, 1)
+	ch := make(chan []string, 2)
 	group := errgroup.Group{}
 	group.Go(func() error {
 		for devices := range ch {
@@ -93,6 +100,10 @@ func processTL(campaign int, path string, db *bbolt.DB) error {
 	err = group.Wait()
 	if err != nil {
 		return err
+	}
+	err = db.Sync()
+	if err != nil {
+		return nil
 	}
 	time := time.Since(start)
 	pCounter.Add(float64(count))
@@ -177,6 +188,8 @@ func main() {
 		http.ListenAndServe("localhost:8080", nil)
 	}()
 
+	listen := flag.String("listen", "", "Listen address")
+
 	//campaign := flag.Int("campaign", 1, "Campaign ID")
 	//list := flag.String("list", "/home/kinou/Downloads/202412071544000", "List of files to process")
 
@@ -185,6 +198,7 @@ func main() {
 	db, err := bbolt.Open("db-update.bolt", 0o666, &bbolt.Options{
 		FreelistType:   bbolt.FreelistMapType,
 		NoFreelistSync: true,
+		NoSync:         true,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -201,6 +215,10 @@ func main() {
 
 		return nil
 	})
+
+	if *listen != "" {
+		go StartRedconServer(*listen, db)
+	}
 	//err = processTL(*campaign, *list, db)
 	matches, err := filepath.Glob("updates/*.csv")
 	err = loadTLs(matches, db)
@@ -223,4 +241,46 @@ func loadTLs(paths []string, db *bbolt.DB) error {
 		}
 	}
 	return nil
+}
+
+func StartRedconServer(addr string, db *bbolt.DB) {
+	redcon.ListenAndServe(":6379", func(conn redcon.Conn, cmd redcon.Command) {
+		/*
+			cmds := make([]string, len(cmd.Args))
+			for arg := range cmd.Args {
+				cmds[arg] = string(cmd.Args[arg])
+			}
+			fmt.Println("Command:", cmds)
+		*/
+
+		switch string(cmd.Args[0]) {
+		case "GET":
+			timer := prometheus.NewTimer(histo)
+			err := db.View(func(tx *bbolt.Tx) error {
+				bucket := tx.Bucket([]byte("device"))
+				v := bucket.Get(cmd.Args[1])
+				timer.ObserveDuration()
+				if v == nil {
+					conn.WriteNull()
+					return nil
+				}
+
+				conn.WriteRaw(v)
+				return nil
+			})
+			if err != nil {
+				conn.WriteError("Error getting data")
+			}
+
+		case "PING":
+			conn.WriteString("PONG")
+		default:
+			conn.WriteError("ERR unknown command '" + string(cmd.Args[0]) + "'")
+		}
+
+	}, func(conn redcon.Conn) bool {
+		return true
+	},
+		func(conn redcon.Conn, err error) {
+		})
 }
